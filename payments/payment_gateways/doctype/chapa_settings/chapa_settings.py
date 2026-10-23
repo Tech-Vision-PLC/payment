@@ -83,6 +83,14 @@ class ChapaSettings(Document):
 
         tx_ref = f"{self.data.payment}-{uuid.uuid4().hex[:10]}"
 
+        # Persist the reference before contacting Chapa. Verification can then
+        # resolve the callback by an exact database lookup instead of parsing
+        # the LMS Payment name out of a gateway-generated string.
+        payment = frappe.get_doc("LMS Payment", self.data.payment)
+        payment.chapa_tx_ref = tx_ref
+        payment.save(ignore_permissions=True)
+        frappe.db.commit()
+
         email = (
             self.data.get("payer_email")
             or frappe.session.user
@@ -187,11 +195,9 @@ def verify_payment():
     if payment_data.get("tx_ref") != tx_ref:
         frappe.throw(_("Payment reference mismatch"))
 
-    # Extract LMS Payment document name from:
-    # LMS-PAY-00001-<random Chapa suffix>
-    payment_name = tx_ref.rsplit("-", 1)[0]
+    payment_name = frappe.db.get_value("LMS Payment", {"chapa_tx_ref": tx_ref}, "name")
 
-    if not frappe.db.exists("LMS Payment", payment_name):
+    if not payment_name:
         frappe.throw(_("LMS Payment not found"))
 
     payment = frappe.get_doc("LMS Payment", payment_name)
@@ -208,7 +214,14 @@ def verify_payment():
     if not payment.member:
         frappe.throw(_("Payment member not found"))
 
-    if not payment.payment_received:
+    # Verification happens over the network before taking this lock. The lock
+    # serializes concurrent callbacks for this payment so enrollment is only
+    # completed once.
+    payment_received = frappe.db.get_value(
+        "LMS Payment", payment.name, "payment_received", for_update=True
+    )
+
+    if not payment_received:
         from lms.lms.utils import complete_enrollment
 
         payment.payment_received = 1
