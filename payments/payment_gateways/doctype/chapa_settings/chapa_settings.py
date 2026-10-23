@@ -130,6 +130,34 @@ class ChapaSettings(Document):
         }
 
         try:
+            # Fixed split: platform retains 60%, teacher receives 40%.
+            PLATFORM_COMMISSION_RATE = 0.60
+            payment_doc = frappe.get_doc("LMS Payment", self.data.payment)
+            payment_type = payment_doc.payment_for_document_type
+            payment_item = payment_doc.payment_for_document
+            if payment_type not in ("LMS Course", "LMS Batch"):
+                frappe.throw(_("Chapa split payments are only supported for courses and batches."))
+            instructors = frappe.get_all(
+                "Course Instructor",
+                filters={"parenttype": payment_type, "parent": payment_item},
+                pluck="instructor",
+            )
+            instructors = list(dict.fromkeys(instructors))
+            if len(instructors) != 1:
+                frappe.throw(_("A split payment requires exactly one instructor for this course or batch."))
+            payout_account = frappe.db.get_value(
+                "LMS Teacher Payout Account",
+                {"teacher": instructors[0]},
+                ["chapa_subaccount_id", "payout_account_status"],
+                as_dict=True,
+            )
+            if not payout_account or payout_account.payout_account_status != "Ready" or not payout_account.chapa_subaccount_id:
+                frappe.throw(_("The instructor's Chapa payout account is not ready. Please contact the administrator."))
+            payload["subaccounts"] = {
+                "id": payout_account.chapa_subaccount_id,
+                "split_type": "percentage",
+                "split_value": PLATFORM_COMMISSION_RATE,
+            }
             response = requests.post(
                 url,
                 json=payload,
@@ -137,8 +165,6 @@ class ChapaSettings(Document):
                 timeout=30,
             )
 
-            print("STATUS:", response.status_code)
-            print("BODY:", response.text)
 
             response.raise_for_status()
 
