@@ -2,6 +2,9 @@
 # License: MIT
 
 import uuid
+import re
+from decimal import Decimal, InvalidOperation
+
 import requests
 import frappe
 from frappe import _
@@ -12,19 +15,17 @@ from payments.utils import create_payment_gateway
 
 
 class ChapaSettings(Document):
-    
     supported_currencies = ("ETB",)
-    
 
     # -----------------------------
     # REGISTER GATEWAY
     # -----------------------------
     def on_update(self):
-        create_payment_gateway(
-            "Chapa",
-            settings="Chapa Settings",
-            controller="ChapaSettings",
-        )
+        # Chapa Settings is a Single DocType, so it cannot be the target of the
+        # Payment Gateway's Dynamic Link field. With no controller stored on the
+        # gateway, get_payment_gateway_controller() loads "Chapa Settings"
+        # directly, as it does for the other single-settings gateways.
+        create_payment_gateway("Chapa")
 
         self.validate_credentials()
 
@@ -52,6 +53,10 @@ class ChapaSettings(Document):
         except requests.RequestException:
             frappe.throw(_("Unable to connect to Chapa API"))
 
+    def validate_transaction_currency(self, currency):
+        if currency and currency not in self.supported_currencies:
+            frappe.throw(_("Chapa only supports ETB transactions"))
+
     # -----------------------------
     # CALLED BY LMS / PAYMENT FLOW
     # -----------------------------
@@ -61,6 +66,9 @@ class ChapaSettings(Document):
         self.data = frappe._dict(kwargs)
 
         return self.initialize_transaction()
+
+    def create_request(self, data):
+        return self.get_payment_url(**data)
 
     # -----------------------------
     # INIT PAYMENT (CHAPA API)
@@ -73,31 +81,83 @@ class ChapaSettings(Document):
             "Content-Type": "application/json",
         }
 
-        tx_ref = f"{self.data.reference_docname}-{uuid.uuid4().hex[:10]}"
+        tx_ref = f"{self.data.payment}-{uuid.uuid4().hex[:10]}"
+
+        # Persist the reference before contacting Chapa. Verification can then
+        # resolve the callback by an exact database lookup instead of parsing
+        # the LMS Payment name out of a gateway-generated string.
+        payment = frappe.get_doc("LMS Payment", self.data.payment)
+        payment.chapa_tx_ref = tx_ref
+        payment.save(ignore_permissions=True)
+        frappe.db.commit()
+
+        email = (
+            self.data.get("payer_email")
+            or frappe.session.user
+        )
+
+        if email == "Guest" or "@" not in email:
+            email = "mehariwamlake@gmail.com"
+
+        title = self.data.get("title") or "Payment"
+        title = re.sub(r"[^A-Za-z0-9_. -]", "", title)
+        title = title[:16]
+
+        description = self.data.get("description") or "i love you to pay"
+        description = re.sub(r"[^A-Za-z0-9_. -]", "", description)
+        description = description[:49]
 
         payload = {
             "amount": str(self.data.amount),
             "currency": "ETB",
-            "email": self.data.payer_email or "mehariwamlake@gmail.com",
-            "first_name": self.data.payer_name or "User",
+            "email": email,
+            "first_name": (
+                self.data.get("payer_name")
+                or "Customer"
+            )[:30],
             "last_name": "",
-            "phone_number": self.data.get("phone_number", ""),
-
+            "phone_number": self.data.get("phone_number") or "",
             "tx_ref": tx_ref,
-
             "callback_url": get_url(
-                "/api/method/payments.payment_gateways.doctype.chapa_settings.chapa_settings.verify_payment"
+                "/api/method/payments.payment_gateways.doctype."
+                "chapa_settings.chapa_settings.verify_payment"
             ),
-
             "return_url": get_url(self.data.redirect_to or "/"),
-
             "customization": {
-                "title": self.data.title or "LMS Payment",
-                "description": self.data.description or "",
+                "title": title,
+                "description": description,
             },
         }
 
         try:
+            # Fixed split: platform retains 60%, teacher receives 40%.
+            PLATFORM_COMMISSION_RATE = 0.60
+            payment_doc = frappe.get_doc("LMS Payment", self.data.payment)
+            payment_type = payment_doc.payment_for_document_type
+            payment_item = payment_doc.payment_for_document
+            if payment_type not in ("LMS Course", "LMS Batch"):
+                frappe.throw(_("Chapa split payments are only supported for courses and batches."))
+            instructors = frappe.get_all(
+                "Course Instructor",
+                filters={"parenttype": payment_type, "parent": payment_item},
+                pluck="instructor",
+            )
+            instructors = list(dict.fromkeys(instructors))
+            if len(instructors) != 1:
+                frappe.throw(_("A split payment requires exactly one instructor for this course or batch."))
+            payout_account = frappe.db.get_value(
+                "LMS Teacher Payout Account",
+                {"teacher": instructors[0]},
+                ["chapa_subaccount_id", "payout_account_status"],
+                as_dict=True,
+            )
+            if not payout_account or payout_account.payout_account_status != "Ready" or not payout_account.chapa_subaccount_id:
+                frappe.throw(_("The instructor's Chapa payout account is not ready. Please contact the administrator."))
+            payload["subaccounts"] = {
+                "id": payout_account.chapa_subaccount_id,
+                "split_type": "percentage",
+                "split_value": PLATFORM_COMMISSION_RATE,
+            }
             response = requests.post(
                 url,
                 json=payload,
@@ -105,63 +165,117 @@ class ChapaSettings(Document):
                 timeout=30,
             )
 
-            # IMPORTANT DEBUG
-            if response.status_code != 200:
-                frappe.log_error(response.text, "Chapa API Error")
-                frappe.throw(_("Chapa API request failed"))
+
+            response.raise_for_status()
 
             result = response.json()
-            print(result)
 
             if result.get("status") != "success":
-                frappe.log_error(str(result), "Chapa Init Error")
-                frappe.throw(_("Chapa rejected the request"))
+                frappe.throw(str(result))
 
-            # 🔥 CRITICAL: redirect LMS directly
-            frappe.local.response["type"] = "redirect"
-            frappe.local.response["location"] = result["data"]["checkout_url"]
+            return result["data"]["checkout_url"]
 
-            return
+        except requests.HTTPError:
+            frappe.throw(response.text)
 
         except Exception:
-            frappe.log_error(frappe.get_traceback(), "Chapa Initialize Error")
-            frappe.throw(_("Unable to initialize Chapa payment"))
+            frappe.throw(frappe.get_traceback())
 
     # -----------------------------
-    # VERIFY PAYMENT (WEBHOOK)
+    # VERIFY PAYMENT + AUTO ENROLLMENT
     # -----------------------------
-    @frappe.whitelist(allow_guest=True)
-    def verify_payment(self):
-        tx_ref = frappe.form_dict.get("tx_ref")
 
-        if not tx_ref:
-            frappe.throw(_("Missing tx_ref"))
 
-        headers = {
-            "Authorization": f"Bearer {self.get_password('secret_key')}"
-        }
+@frappe.whitelist(allow_guest=True)
+def verify_payment():
+    tx_ref = (
+        frappe.form_dict.get("trx_ref")
+        or frappe.form_dict.get("tx_ref")
+    )
 
-        r = requests.get(
-            f"https://api.chapa.co/v1/transaction/verify/{tx_ref}",
-            headers=headers,
-            timeout=15,
-        )
+    if not tx_ref:
+        frappe.throw(_("Missing tx_ref"))
 
-        r.raise_for_status()
-        data = r.json()
+    settings = frappe.get_doc("Chapa Settings", "Chapa Settings")
+    
+    headers = {
+        "Authorization": f"Bearer {settings.get_password('secret_key')}"
+    }
 
-        if data.get("status") != "success":
-            frappe.throw(_("Payment verification failed"))
+    r = requests.get(
+        f"https://api.chapa.co/v1/transaction/verify/{tx_ref}",
+        headers=headers,
+        timeout=15,
+    )
 
-        return {
-            "status": "success",
-            "tx_ref": tx_ref,
-            "data": data.get("data"),
-        }
+    r.raise_for_status()
+    result = r.json()
+    payment_data = result.get("data") or {}
 
-    # -----------------------------
-    # VALIDATION
-    # -----------------------------
-    def validate_transaction_currency(self, currency):
-        if currency and currency not in self.supported_currencies:
-            frappe.throw(_("Chapa only supports ETB transactions"))
+    if (
+        result.get("status") != "success"
+        or payment_data.get("status") != "success"
+    ):
+        frappe.throw(_("Payment verification failed"))
+
+    if payment_data.get("tx_ref") != tx_ref:
+        frappe.throw(_("Payment reference mismatch"))
+
+    payment_name = frappe.db.get_value("LMS Payment", {"chapa_tx_ref": tx_ref}, "name")
+
+    if not payment_name:
+        frappe.throw(_("LMS Payment not found"))
+
+    payment = frappe.get_doc("LMS Payment", payment_name)
+
+    try:
+        paid_amount = Decimal(str(payment_data.get("amount")))
+        expected_amount = Decimal(str(payment.amount_with_gst or payment.amount))
+    except (InvalidOperation, TypeError, ValueError):
+        frappe.throw(_("Invalid payment amount returned by Chapa"))
+
+    if paid_amount != expected_amount or payment_data.get("currency") != payment.currency:
+        frappe.throw(_("Payment amount or currency mismatch"))
+
+    if not payment.member:
+        frappe.throw(_("Payment member not found"))
+
+    # Verification happens over the network before taking this lock. The lock
+    # serializes concurrent callbacks for this payment so enrollment is only
+    # completed once.
+    payment_received = frappe.db.get_value(
+        "LMS Payment", payment.name, "payment_received", for_update=True
+    )
+
+    if not payment_received:
+        from lms.lms.utils import complete_enrollment
+
+        payment.payment_received = 1
+        payment.payment_id = payment_data.get("reference")
+        payment.save(ignore_permissions=True)
+
+        # Chapa calls this endpoint as Guest. LMS enrollment uses
+        # frappe.session.user, so switch temporarily to the actual payer.
+        original_user = frappe.session.user
+
+        try:
+            frappe.set_user(payment.member)
+
+            # Automatically creates LMS Enrollment, LMS Batch Enrollment,
+            # or certificate-purchase state based on the LMS Payment record.
+            complete_enrollment(
+                payment.name,
+                payment.payment_for_document_type,
+                payment.payment_for_document,
+            )
+
+        finally:
+            frappe.set_user(original_user)
+
+        frappe.db.commit()
+
+    return {
+        "status": "success",
+        "tx_ref": tx_ref,
+        "data": payment_data,
+    }
